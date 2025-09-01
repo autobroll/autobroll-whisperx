@@ -26,6 +26,9 @@ COMPUTE_TYPE = os.getenv("WHISPERX_COMPUTE_TYPE", "float16" if DEVICE == "cuda" 
 DIARIZATION = os.getenv("WHISPERX_DIARIZATION", "false").lower() == "true"
 HF_TOKEN = os.getenv("HUGGINGFACE_TOKEN", os.getenv("HF_TOKEN", ""))
 
+# Désactive le VAD par défaut pour éviter les erreurs de téléchargement (HTTP 301)
+VAD_ENABLED = os.getenv("WHISPERX_VAD", "false").lower() == "true"
+
 API_KEY = os.getenv("API_KEY", "")  # ex: autobroll_secret_1
 
 app = FastAPI(title="whisperx-api", version="1.0.0")
@@ -78,7 +81,12 @@ def _extract_audio_16k_mono(in_path: str) -> str:
 def _ensure_asr_model(language: Optional[str] = None):
     # Load ASR once
     if _models_cache["asr"] is None:
-        _models_cache["asr"] = whisperx.load_model(WHISPERX_MODEL, DEVICE, compute_type=COMPUTE_TYPE)
+        _models_cache["asr"] = whisperx.load_model(
+            WHISPERX_MODEL,
+            DEVICE,
+            compute_type=COMPUTE_TYPE,
+            vad=VAD_ENABLED,  # ← VAD off par défaut pour éviter l'erreur HTTP 301
+        )
     # No strict language binding needed; store last requested language
     if language:
         _models_cache["asr_lang"] = language
@@ -155,6 +163,7 @@ def health():
         "model": WHISPERX_MODEL,
         "compute_type": COMPUTE_TYPE,
         "diarization": DIARIZATION,
+        "vad_enabled": VAD_ENABLED,
         "auth_required": bool(API_KEY),
     }
 
@@ -200,7 +209,14 @@ async def _process_any(in_path: str, language: Optional[str] = None):
 
         # 2) Alignment
         align_model, metadata = _get_align_model(lang)
-        aligned = whisperx.align(result["segments"], align_model, metadata, wav_path, DEVICE, return_char_alignments=False)
+        aligned = whisperx.align(
+            result["segments"],
+            align_model,
+            metadata,
+            wav_path,
+            DEVICE,
+            return_char_alignments=False
+        )
 
         # 3) Diarization (optional)
         if DIARIZATION:
