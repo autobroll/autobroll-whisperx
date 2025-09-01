@@ -11,6 +11,10 @@ on:
       - '.github/workflows/docker-build.yml'
   workflow_dispatch:
 
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -18,10 +22,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Prépare un nom d'image en minuscules : <dockerhub_user>/<repo>
+      # Prépare le nom d'image en minuscules : <dockerhub_user>/<repo>
       - name: Prepare image name
         run: |
-          echo "IMAGE_NAME=${{ secrets.DOCKERHUB_USERNAME }}/$(echo ${{ github.event.repository.name }} | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
+          REPO_LC=$(echo "${{ github.event.repository.name }}" | tr '[:upper:]' '[:lower:]')
+          echo "IMAGE_NAME=${{ secrets.DOCKERHUB_USERNAME }}/${REPO_LC}" >> $GITHUB_ENV
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -39,10 +44,11 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
+          file: ./Dockerfile
           push: true
-          platforms: linux/amd64   # tu peux ajouter linux/arm64 si besoin
+          platforms: linux/amd64
           tags: |
             ${{ env.IMAGE_NAME }}:latest
             ${{ env.IMAGE_NAME }}:${{ github.sha }}
-          cache-from: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache
-          cache-to: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache,mode=max
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
