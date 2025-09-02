@@ -1,0 +1,2 @@
+# Forcer la version compatible avec whisperx==3.1.4
+faster-whisper==1.0.1
