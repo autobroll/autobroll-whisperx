@@ -18,6 +18,30 @@ import aiohttp
 
 import whisperx  # pip install whisperx
 
+# --------- BYPASS VAD (évite tout download / erreur 301) ----------
+# Certaines versions de whisperx chargent toujours le VAD. On monkey-patch.
+try:
+    import whisperx.vad as wxvad
+
+    def _load_vad_model_noop(*args, **kwargs):
+        class _DummyVAD:
+            pass
+        return _DummyVAD()
+
+    def _get_speech_timestamps_noop(audio, *args, **kwargs):
+        # Renvoie un seul segment qui couvre tout l'audio (en échantillons)
+        try:
+            n = len(audio)
+        except Exception:
+            n = 0
+        return [{"start": 0, "end": n}]
+
+    wxvad.load_vad_model = _load_vad_model_noop
+    wxvad.get_speech_timestamps = _get_speech_timestamps_noop
+except Exception:
+    # Si l'import échoue, on ignore — mais sur whisperx normal ça passe.
+    pass
+
 # -------------------- Config --------------------
 WHISPERX_MODEL = os.getenv("WHISPERX_MODEL", "large-v2")
 DEVICE_ENV = os.getenv("WHISPERX_DEVICE", "").strip().lower()
@@ -25,9 +49,6 @@ DEVICE = DEVICE_ENV if DEVICE_ENV in ("cuda", "cpu") else ("cuda" if torch.cuda.
 COMPUTE_TYPE = os.getenv("WHISPERX_COMPUTE_TYPE", "float16" if DEVICE == "cuda" else "int8")
 DIARIZATION = os.getenv("WHISPERX_DIARIZATION", "false").lower() == "true"
 HF_TOKEN = os.getenv("HUGGINGFACE_TOKEN", os.getenv("HF_TOKEN", ""))
-
-# On lit l'env mais on VA FORCER le VAD à False au runtime pour contourner l'erreur 301
-VAD_ENABLED_ENV = os.getenv("WHISPERX_VAD", "false").lower() == "true"
 
 API_KEY = os.getenv("API_KEY", "")  # ex: autobroll_secret_1
 
@@ -81,21 +102,12 @@ def _extract_audio_16k_mono(in_path: str) -> str:
 def _ensure_asr_model(language: Optional[str] = None):
     # Load ASR once
     if _models_cache["asr"] is None:
-        try:
-            # FORCING: pas de VAD (use_vad=False) pour contourner l'erreur 301
-            _models_cache["asr"] = whisperx.load_model(
-                WHISPERX_MODEL,
-                DEVICE,
-                compute_type=COMPUTE_TYPE,
-                vad_options={"use_vad": False}
-            )
-        except TypeError:
-            # Fallback si signature différente : sans paramètre vad_options (toujours sans VAD)
-            _models_cache["asr"] = whisperx.load_model(
-                WHISPERX_MODEL,
-                DEVICE,
-                compute_type=COMPUTE_TYPE
-            )
+        # Ne PAS passer d'options VAD ici : notre monkey-patch évite tout download/usage.
+        _models_cache["asr"] = whisperx.load_model(
+            WHISPERX_MODEL,
+            DEVICE,
+            compute_type=COMPUTE_TYPE
+        )
     if language:
         _models_cache["asr_lang"] = language
 
@@ -170,10 +182,7 @@ def health():
         "model": WHISPERX_MODEL,
         "compute_type": COMPUTE_TYPE,
         "diarization": DIARIZATION,
-        # ce qui est demandé en env (info)
-        "vad_requested_env": VAD_ENABLED_ENV,
-        # l'état effectif : on force OFF
-        "vad_effective": False,
+        "vad_effective": False,         # on force OFF via monkey-patch
         "auth_required": bool(API_KEY),
     }
 
