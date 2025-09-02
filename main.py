@@ -32,9 +32,9 @@ API_KEY = os.getenv("API_KEY", "")  # ex: autobroll_secret_1
 app = FastAPI(title="whisperx-api", version="1.0.0")
 
 _models_cache: Dict[str, Any] = {
-    "asr_fw": None,              # faster-whisper WhisperModel
+    "asr_fw": None,             # faster-whisper WhisperModel
     "align": {},                # language -> (align_model, metadata)
-    "diar": None               # diarization pipeline
+    "diar": None                # diarization pipeline
 }
 
 # -------------------- Auth helper --------------------
@@ -160,7 +160,27 @@ def health():
         "compute_type": COMPUTE_TYPE,
         "diarization": DIARIZATION,
         "auth_required": bool(API_KEY),
-        "engine": "faster-whisper + whisperx-align"  # VAD totalement bypassé
+        "engine": "faster-whisper + whisperx-align"
+    }
+
+# ----------- NEW: Warm-up route -----------
+@app.post("/warmup", dependencies=[Depends(require_api_key)])
+def warmup(language: Optional[str] = "fr"):
+    """
+    Précharge les modèles (ASR + alignement [+ diarisation si activée])
+    pour éviter les timeouts du proxy au premier appel.
+    """
+    _ensure_fw_model()
+    _get_align_model(language or "fr")
+    if DIARIZATION:
+        _ensure_diarization()
+    return {
+        "ok": True,
+        "warmed": True,
+        "device": DEVICE,
+        "model": WHISPERX_MODEL,
+        "language": language or "fr",
+        "engine": "faster-whisper + whisperx-align"
     }
 
 @app.post("/transcribe/url", dependencies=[Depends(require_api_key)])
