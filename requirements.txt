@@ -4,7 +4,7 @@ aiohttp==3.9.5
 numpy==1.26.4
 ffmpeg-python==0.2.0
 
-# WhisperX (alignement + diarisation optionnelle)
+# WhisperX
 whisperx==3.1.4
 
 # Pydantic v2
