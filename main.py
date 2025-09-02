@@ -1,7 +1,5 @@
 # main.py
 import os
-import io
-import json
 import tempfile
 from typing import Optional, List, Dict, Any
 
@@ -11,39 +9,15 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 import torch
-import numpy as np
 import ffmpeg
 import aiohttp
 
-import whisperx  # pip install whisperx
-
-# ---------- BYPASS VAD directement dans whisperx.asr ----------
-# On neutralise le VAD à la source et on renvoie un segment unique couvrant tout l'audio.
+import whisperx  # align + diarization
 try:
-    import whisperx.asr as wxasr
-
-    class _DummyVAD:
-        def __call__(self, inputs):
-            # inputs attendu: {"waveform": tensor (1, N), "sample_rate": 16000}
-            try:
-                wav = inputs.get("waveform", None)
-                if wav is None and isinstance(inputs, dict):
-                    wav = inputs["waveform"]
-                n = int(getattr(wav, "shape", [0, 0])[-1])
-                sr = int(inputs.get("sample_rate", 16000))
-                dur = (n / sr) if sr else 0.0
-            except Exception:
-                dur = 0.0
-            # renvoie des bornes en secondes (format généralement attendu)
-            return [{"start": 0.0, "end": float(dur)}]
-
-    def _load_vad_model_noop(*args, **kwargs):
-        return _DummyVAD()
-
-    # Monkey-patch : plus aucun téléchargement / appel VAD réel
-    wxasr.load_vad_model = _load_vad_model_noop
+    from faster_whisper import WhisperModel  # ASR direct, sans VAD
+    _FW_OK = True
 except Exception:
-    pass
+    _FW_OK = False
 
 # -------------------- Config --------------------
 WHISPERX_MODEL = os.getenv("WHISPERX_MODEL", "large-v2")
@@ -53,15 +27,14 @@ COMPUTE_TYPE = os.getenv("WHISPERX_COMPUTE_TYPE", "float16" if DEVICE == "cuda" 
 DIARIZATION = os.getenv("WHISPERX_DIARIZATION", "false").lower() == "true"
 HF_TOKEN = os.getenv("HUGGINGFACE_TOKEN", os.getenv("HF_TOKEN", ""))
 
-API_KEY = os.getenv("API_KEY", "")
+API_KEY = os.getenv("API_KEY", "")  # ex: autobroll_secret_1
 
 app = FastAPI(title="whisperx-api", version="1.0.0")
 
-_models_cache = {
-    "asr": None,
-    "asr_lang": None,
-    "align": {},
-    "diar": None
+_models_cache: Dict[str, Any] = {
+    "asr_fw": None,              # faster-whisper WhisperModel
+    "align": {},                # language -> (align_model, metadata)
+    "diar": None               # diarization pipeline
 }
 
 # -------------------- Auth helper --------------------
@@ -84,32 +57,38 @@ async def _download_url_to_file(url: str, suffix: str = "") -> str:
     return tmp_path
 
 def _extract_audio_16k_mono(in_path: str) -> str:
-    out_fd, out_path = tempfile.mkstemp(suffix=".wav"); os.close(out_fd)
+    out_fd, out_path = tempfile.mkstemp(suffix=".wav")
+    os.close(out_fd)
     try:
-        (ffmpeg.input(in_path)
-               .output(out_path, ac=1, ar="16000", f="wav", vn=None, loglevel="error")
-               .overwrite_output()
-               .run())
+        (
+            ffmpeg
+            .input(in_path)
+            .output(out_path, ac=1, ar="16000", f="wav", vn=None, loglevel="error")
+            .overwrite_output()
+            .run()
+        )
     except ffmpeg.Error as e:
-        try: os.unlink(out_path)
-        except: pass
+        try:
+            os.unlink(out_path)
+        except:
+            pass
         raise HTTPException(status_code=400, detail=f"ffmpeg failed: {e}")
     return out_path
 
-def _ensure_asr_model(language: Optional[str] = None):
-    if _models_cache["asr"] is None:
-        _models_cache["asr"] = whisperx.load_model(
+def _ensure_fw_model():
+    if not _FW_OK:
+        raise HTTPException(
+            status_code=500,
+            detail="faster-whisper n'est pas disponible. Ajoute `faster-whisper>=1.0.0` à requirements.txt et rebuild l'image."
+        )
+    if _models_cache["asr_fw"] is None:
+        # device "cuda" ou "cpu"; compute_type: float16 (cuda) ou int8 (cpu)
+        _models_cache["asr_fw"] = WhisperModel(
             WHISPERX_MODEL,
-            DEVICE,
+            device=DEVICE,
             compute_type=COMPUTE_TYPE
         )
-        # Ceinture et bretelles : on force aussi la propriété vad_model de l'objet
-        try:
-            _models_cache["asr"].vad_model = _DummyVAD()
-        except Exception:
-            pass
-    if language:
-        _models_cache["asr_lang"] = language
+    return _models_cache["asr_fw"]
 
 def _get_align_model(language: str):
     if language in _models_cache["align"]:
@@ -169,7 +148,7 @@ def _merge_words_into_segments(aligned_result: Dict[str, Any]) -> List[Dict[str,
 # -------------------- Schemas --------------------
 class TranscribeUrlIn(BaseModel):
     url: str
-    language: Optional[str] = None
+    language: Optional[str] = None  # e.g., "fr", "en"
 
 # -------------------- Routes --------------------
 @app.get("/health")
@@ -180,8 +159,8 @@ def health():
         "model": WHISPERX_MODEL,
         "compute_type": COMPUTE_TYPE,
         "diarization": DIARIZATION,
-        "vad_effective": False,
         "auth_required": bool(API_KEY),
+        "engine": "faster-whisper + whisperx-align"  # VAD totalement bypassé
     }
 
 @app.post("/transcribe/url", dependencies=[Depends(require_api_key)])
@@ -190,8 +169,10 @@ async def transcribe_url(body: TranscribeUrlIn):
     try:
         return await _process_any(media_path, language=body.language)
     finally:
-        try: os.unlink(media_path)
-        except: pass
+        try:
+            os.unlink(media_path)
+        except:
+            pass
 
 @app.post("/transcribe/file", dependencies=[Depends(require_api_key)])
 async def transcribe_file(file: UploadFile = File(...), language: Optional[str] = Form(None)):
@@ -202,44 +183,61 @@ async def transcribe_file(file: UploadFile = File(...), language: Optional[str] 
     try:
         return await _process_any(tmp_path, language=language)
     finally:
-        try: os.unlink(tmp_path)
-        except: pass
+        try:
+            os.unlink(tmp_path)
+        except:
+            pass
 
 # -------------------- Core processing --------------------
 async def _process_any(in_path: str, language: Optional[str] = None):
     wav_path = _extract_audio_16k_mono(in_path)
     try:
-        _ensure_asr_model(language=language)
+        # 1) ASR via faster-whisper (aucun VAD)
+        asr = _ensure_fw_model()
+        segments_iter, info = asr.transcribe(
+            wav_path,
+            language=language,
+            vad_filter=False,        # <- VAD désactivé
+            beam_size=5
+        )
+        segments_list = []
+        for seg in segments_iter:
+            segments_list.append({
+                "start": float(seg.start),
+                "end": float(seg.end),
+                "text": (seg.text or "").strip()
+            })
+        lang = language or getattr(info, "language", "en")
 
-        # 1) ASR
-        asr_model = _models_cache["asr"]
-        result = asr_model.transcribe(wav_path, language=language)
-
-        # 2) Langue
-        lang = language or result.get("language", "en")
-
-        # 3) Alignement
+        # 2) Alignement mot-à-mot via WhisperX
         align_model, metadata = _get_align_model(lang)
         aligned = whisperx.align(
-            result["segments"], align_model, metadata, wav_path, DEVICE, return_char_alignments=False
+            segments_list,
+            align_model,
+            metadata,
+            wav_path,
+            DEVICE,
+            return_char_alignments=False
         )
 
-        # 4) Diarisation (optionnelle)
+        # 3) Diarisation (optionnelle)
         if DIARIZATION:
             diar = _ensure_diarization()
             if diar is not None:
                 diar_segments = diar(wav_path)
                 aligned = whisperx.assign_word_speakers(diar_segments, aligned)
 
-        # 5) Sorties
-        segments = _merge_words_into_segments(aligned)
-        vtt = _to_vtt(segments)
-        srt = _to_srt(segments)
+        # 4) Sorties (VTT / SRT)
+        merged = _merge_words_into_segments(aligned)
+        vtt = _to_vtt(merged)
+        srt = _to_srt(merged)
 
-        return JSONResponse({"ok": True, "language": lang, "segments": segments, "vtt": vtt, "srt": srt})
+        return JSONResponse({"ok": True, "language": lang, "segments": merged, "vtt": vtt, "srt": srt})
     finally:
-        try: os.unlink(wav_path)
-        except: pass
+        try:
+            os.unlink(wav_path)
+        except:
+            pass
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8001")), reload=False)
