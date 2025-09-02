@@ -26,8 +26,8 @@ COMPUTE_TYPE = os.getenv("WHISPERX_COMPUTE_TYPE", "float16" if DEVICE == "cuda" 
 DIARIZATION = os.getenv("WHISPERX_DIARIZATION", "false").lower() == "true"
 HF_TOKEN = os.getenv("HUGGINGFACE_TOKEN", os.getenv("HF_TOKEN", ""))
 
-# Désactivé par défaut pour éviter le download VAD qui plantait (HTTP 301)
-VAD_ENABLED = os.getenv("WHISPERX_VAD", "false").lower() == "true"
+# On lit l'env mais on VA FORCER le VAD à False au runtime pour contourner l'erreur 301
+VAD_ENABLED_ENV = os.getenv("WHISPERX_VAD", "false").lower() == "true"
 
 API_KEY = os.getenv("API_KEY", "")  # ex: autobroll_secret_1
 
@@ -82,15 +82,15 @@ def _ensure_asr_model(language: Optional[str] = None):
     # Load ASR once
     if _models_cache["asr"] is None:
         try:
-            # Désactive/active le VAD via vad_options (compatible avec ta version)
+            # FORCING: pas de VAD (use_vad=False) pour contourner l'erreur 301
             _models_cache["asr"] = whisperx.load_model(
                 WHISPERX_MODEL,
                 DEVICE,
                 compute_type=COMPUTE_TYPE,
-                vad_options={"use_vad": VAD_ENABLED}
+                vad_options={"use_vad": False}
             )
         except TypeError:
-            # Fallback si la signature change : sans VAD options
+            # Fallback si signature différente : sans paramètre vad_options (toujours sans VAD)
             _models_cache["asr"] = whisperx.load_model(
                 WHISPERX_MODEL,
                 DEVICE,
@@ -170,7 +170,10 @@ def health():
         "model": WHISPERX_MODEL,
         "compute_type": COMPUTE_TYPE,
         "diarization": DIARIZATION,
-        "vad_enabled": VAD_ENABLED,
+        # ce qui est demandé en env (info)
+        "vad_requested_env": VAD_ENABLED_ENV,
+        # l'état effectif : on force OFF
+        "vad_effective": False,
         "auth_required": bool(API_KEY),
     }
 
