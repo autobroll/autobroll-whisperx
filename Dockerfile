@@ -14,14 +14,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# --- D'abord Torch/Torchaudio en cu121 (compatibles cuDNN 8 de cette image) ---
+# --- Torch/Torchaudio en cu121 (compatibles avec cette image) ---
 RUN python3 -m pip install --upgrade pip setuptools wheel && \
     pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu121 \
         torch==2.1.0+cu121 torchaudio==2.1.0+cu121
 
-# --- Puis le reste des deps ---
-COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+# --- Dépendances de l'app ---
+COPY requirements.txt constraints.txt ./
+
+# Debug : afficher ce que le build utilise vraiment
+RUN echo "===== requirements.txt utilisé par le build =====" && cat requirements.txt && \
+    echo "===== constraints.txt =====" && cat constraints.txt && \
+    pip install --no-cache-dir -r requirements.txt -c constraints.txt
 
 # --- Code ---
 COPY . .
