@@ -26,7 +26,7 @@ COMPUTE_TYPE = os.getenv("WHISPERX_COMPUTE_TYPE", "float16" if DEVICE == "cuda" 
 DIARIZATION = os.getenv("WHISPERX_DIARIZATION", "false").lower() == "true"
 HF_TOKEN = os.getenv("HUGGINGFACE_TOKEN", os.getenv("HF_TOKEN", ""))
 
-# Désactive le VAD par défaut pour éviter les erreurs de téléchargement (HTTP 301)
+# Désactivé par défaut pour éviter le download VAD qui plantait (HTTP 301)
 VAD_ENABLED = os.getenv("WHISPERX_VAD", "false").lower() == "true"
 
 API_KEY = os.getenv("API_KEY", "")  # ex: autobroll_secret_1
@@ -81,13 +81,21 @@ def _extract_audio_16k_mono(in_path: str) -> str:
 def _ensure_asr_model(language: Optional[str] = None):
     # Load ASR once
     if _models_cache["asr"] is None:
-        _models_cache["asr"] = whisperx.load_model(
-            WHISPERX_MODEL,
-            DEVICE,
-            compute_type=COMPUTE_TYPE,
-            vad=VAD_ENABLED,  # ← VAD off par défaut pour éviter l'erreur HTTP 301
-        )
-    # No strict language binding needed; store last requested language
+        try:
+            # Désactive/active le VAD via vad_options (compatible avec ta version)
+            _models_cache["asr"] = whisperx.load_model(
+                WHISPERX_MODEL,
+                DEVICE,
+                compute_type=COMPUTE_TYPE,
+                vad_options={"use_vad": VAD_ENABLED}
+            )
+        except TypeError:
+            # Fallback si la signature change : sans VAD options
+            _models_cache["asr"] = whisperx.load_model(
+                WHISPERX_MODEL,
+                DEVICE,
+                compute_type=COMPUTE_TYPE
+            )
     if language:
         _models_cache["asr_lang"] = language
 
@@ -128,7 +136,6 @@ def _to_vtt(segments: List[Dict[str, Any]]) -> str:
     return "\n".join(out).strip() + "\n"
 
 def _merge_words_into_segments(aligned_result: Dict[str, Any]) -> List[Dict[str, Any]]:
-    # Keep whisperx format; ensure words list exists
     segs = []
     for seg in aligned_result.get("segments", []):
         s = {
