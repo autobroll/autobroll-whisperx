@@ -9,6 +9,3 @@ whisperx==3.1.4
 
 # Pydantic v2
 pydantic==2.7.1
-
-# ASR (GPU/CPU) — utilisé dans main.py
-faster-whisper==1.0.1
