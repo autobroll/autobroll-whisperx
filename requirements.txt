@@ -4,12 +4,11 @@ aiohttp==3.9.5
 numpy==1.26.4
 ffmpeg-python==0.2.0
 
-# PyTorch (CUDA 12.1) — doit matcher l'image GPU côté provider
-torch==2.1.2
-torchaudio==2.1.2
-
-# WhisperX stable
+# WhisperX (alignement + diarisation optionnelle)
 whisperx==3.1.4
 
-# Pydantic v2 (compatible avec FastAPI >=0.100)
+# Pydantic v2
 pydantic==2.7.1
+
+# ASR (GPU/CPU) — utilisé dans main.py
+faster-whisper==1.0.3
