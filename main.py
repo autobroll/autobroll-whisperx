@@ -18,10 +18,11 @@ import aiohttp
 
 import whisperx  # pip install whisperx
 
-# --------- BYPASS VAD (évite tout download / erreur 301) ----------
-# Certaines versions de whisperx chargent toujours le VAD. On monkey-patch.
+# --------- BYPASS VAD, directement dans whisperx.asr ----------
+# Certaines versions importent load_vad_model / get_speech_timestamps DANS whisperx.asr,
+# donc on monkey-patch à cet endroit pour éviter tout download et tout usage réel du VAD.
 try:
-    import whisperx.vad as wxvad
+    import whisperx.asr as wxasr
 
     def _load_vad_model_noop(*args, **kwargs):
         class _DummyVAD:
@@ -29,17 +30,16 @@ try:
         return _DummyVAD()
 
     def _get_speech_timestamps_noop(audio, *args, **kwargs):
-        # Renvoie un seul segment qui couvre tout l'audio (en échantillons)
         try:
             n = len(audio)
         except Exception:
             n = 0
+        # un seul segment couvrant tout l'audio
         return [{"start": 0, "end": n}]
 
-    wxvad.load_vad_model = _load_vad_model_noop
-    wxvad.get_speech_timestamps = _get_speech_timestamps_noop
+    wxasr.load_vad_model = _load_vad_model_noop
+    wxasr.get_speech_timestamps = _get_speech_timestamps_noop
 except Exception:
-    # Si l'import échoue, on ignore — mais sur whisperx normal ça passe.
     pass
 
 # -------------------- Config --------------------
@@ -56,9 +56,9 @@ app = FastAPI(title="whisperx-api", version="1.0.0")
 
 _models_cache = {
     "asr": None,                 # whisperx ASR model
-    "asr_lang": None,           # language code detected/forced
-    "align": {},                # language -> (align_model, metadata)
-    "diar": None                # diarization pipeline
+    "asr_lang": None,            # language code detected/forced
+    "align": {},                 # language -> (align_model, metadata)
+    "diar": None                 # diarization pipeline
 }
 
 # -------------------- Auth helper --------------------
@@ -74,7 +74,7 @@ async def _download_url_to_file(url: str, suffix: str = "") -> str:
     async with aiohttp.ClientSession() as session:
         async with session.get(url) as resp:
             if resp.status != 200:
-                raise HTTPException(status_code=400, detail=f"Failed to fetch media: {resp.status}")
+                raise HTTPException(status_code=400, detail=f"Failed to fetch media: HTTP %s" % resp.status)
             with open(tmp_path, "wb") as f:
                 async for chunk in resp.content.iter_chunked(1 << 20):
                     f.write(chunk)
@@ -100,9 +100,8 @@ def _extract_audio_16k_mono(in_path: str) -> str:
     return out_path
 
 def _ensure_asr_model(language: Optional[str] = None):
-    # Load ASR once
     if _models_cache["asr"] is None:
-        # Ne PAS passer d'options VAD ici : notre monkey-patch évite tout download/usage.
+        # IMPORTANT: pas d'options VAD ici ; notre patch empêche toute tentative VAD côté asr
         _models_cache["asr"] = whisperx.load_model(
             WHISPERX_MODEL,
             DEVICE,
@@ -182,7 +181,7 @@ def health():
         "model": WHISPERX_MODEL,
         "compute_type": COMPUTE_TYPE,
         "diarization": DIARIZATION,
-        "vad_effective": False,         # on force OFF via monkey-patch
+        "vad_effective": False,      # forcé OFF
         "auth_required": bool(API_KEY),
     }
 
@@ -215,7 +214,6 @@ async def transcribe_file(file: UploadFile = File(...), language: Optional[str] 
 # -------------------- Core processing --------------------
 async def _process_any(in_path: str, language: Optional[str] = None):
     wav_path = _extract_audio_16k_mono(in_path)
-
     try:
         _ensure_asr_model(language=language)
 
@@ -223,10 +221,10 @@ async def _process_any(in_path: str, language: Optional[str] = None):
         asr_model = _models_cache["asr"]
         result = asr_model.transcribe(wav_path, language=language)
 
-        # Detect language if not provided
+        # 2) Langue
         lang = language or result.get("language", "en")
 
-        # 2) Alignment
+        # 3) Alignement
         align_model, metadata = _get_align_model(lang)
         aligned = whisperx.align(
             result["segments"],
@@ -237,25 +235,19 @@ async def _process_any(in_path: str, language: Optional[str] = None):
             return_char_alignments=False
         )
 
-        # 3) Diarization (optional)
+        # 4) Diarisation (optionnelle)
         if DIARIZATION:
             diar = _ensure_diarization()
             if diar is not None:
                 diar_segments = diar(wav_path)
                 aligned = whisperx.assign_word_speakers(diar_segments, aligned)
 
-        # 4) Build outputs
+        # 5) Sorties
         segments = _merge_words_into_segments(aligned)
         vtt = _to_vtt(segments)
         srt = _to_srt(segments)
 
-        return JSONResponse({
-            "ok": True,
-            "language": lang,
-            "segments": segments,
-            "vtt": vtt,
-            "srt": srt
-        })
+        return JSONResponse({"ok": True, "language": lang, "segments": segments, "vtt": vtt, "srt": srt})
     finally:
         try:
             os.unlink(wav_path)
