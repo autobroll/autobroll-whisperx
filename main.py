@@ -5,6 +5,9 @@ import tempfile
 from typing import Optional, List, Dict, Any, Tuple
 import multiprocessing as mp
 import threading
+import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 
 import uvicorn
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Header, Depends, Query
@@ -52,7 +55,13 @@ DEVICE_INDEX = int(os.getenv("WHISPERX_DEVICE_INDEX", "0"))  # utile sur certain
 # Timeout (sec) pour tuer proprement le sous-processus GPU si blocage
 ASR_GPU_TIMEOUT = int(os.getenv("WHISPERX_ASR_GPU_TIMEOUT", "180"))
 
-app = FastAPI(title="whisperx-api", version="1.2.0")
+# --- Async/polling pour éviter Cloudflare 524 ---
+_JOBS: Dict[str, Dict[str, Any]] = {}  # job_id -> {"status": "...", "result":..., "error":...}
+_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("ASYNC_MAX_WORKERS", "1")))
+FORCE_ASYNC = os.getenv("FORCE_ASYNC", "true").lower() == "true"  # par défaut on envoie 202 + polling
+CF_BUDGET_SECONDS = int(os.getenv("CF_BUDGET_SECONDS", "95"))     # budget "safe" derrière CF (~100s)
+
+app = FastAPI(title="whisperx-api", version="1.3.0")
 
 _models_cache: Dict[str, Any] = {
     "asr_fw_cpu": None,         # WhisperModel CPU
@@ -244,6 +253,7 @@ def health():
         "auth_required": bool(API_KEY),
         "engine": "faster-whisper + whisperx-align",
         "device_index": DEVICE_INDEX,
+        "force_async": FORCE_ASYNC,
     }
 
 @app.post("/warmup", dependencies=[Depends(require_api_key)])
@@ -280,37 +290,136 @@ def warmup_gpu():
     threading.Thread(target=_prefetch_gpu_model, daemon=True).start()
     return {"ok": True, "started": True, "device": DEVICE, "compute_type": COMPUTE_TYPE}
 
-# --- Transcribe endpoints (avec paramètre engine)
+# -------------------- Pipeline synchrone factorisé --------------------
+def _run_pipeline_sync(in_path: str, language: Optional[str], engine: str) -> Dict[str, Any]:
+    """
+    Exécute la même logique que _process_any mais retourne un dict (pas une JSONResponse).
+    Sert pour les jobs asynchrones.
+    """
+    wav_path = _extract_audio_16k_mono(in_path)
+    try:
+        # 1) ASR
+        if engine.lower() == "cpu" or DEVICE != "cuda":
+            asr_cpu = _ensure_cpu_model()
+            segments_iter, info = asr_cpu.transcribe(
+                wav_path, language=language, vad_filter=VAD_FILTER, beam_size=BEAM_SIZE
+            )
+            segments_list = [{"start": float(s.start), "end": float(s.end), "text": (s.text or "").strip()}
+                             for s in segments_iter]
+            lang = language or getattr(info, "language", "en")
+            dbg = {"engine": "cpu", "forced": engine.lower() == "cpu"}
+        elif engine.lower() in ("auto", "gpu"):
+            segments_list, lang, dbg = _asr_transcribe_safe_gpu_then_cpu(wav_path, language)
+        else:
+            raise RuntimeError("engine must be auto|cpu|gpu")
+
+        # 2) Alignement (sur ALIGN_DEVICE, par défaut CPU)
+        align_model, metadata = _get_align_model(lang)
+        aligned = whisperx.align(
+            segments_list, align_model, metadata, wav_path, ALIGN_DEVICE, return_char_alignments=False
+        )
+
+        # 3) Diarisation (optionnelle)
+        if DIARIZATION:
+            diar = _ensure_diarization()
+            if diar is not None:
+                diar_segments = diar(wav_path)
+                aligned = whisperx.assign_word_speakers(diar_segments, aligned)
+
+        # 4) Sorties
+        merged = _merge_words_into_segments(aligned)
+        vtt = _to_vtt(merged)
+        srt = _to_srt(merged)
+
+        payload = {"ok": True, "language": lang, "segments": merged, "vtt": vtt, "srt": srt, "dbg": dbg}
+        return payload
+    finally:
+        try: os.unlink(wav_path)
+        except: pass
+
+# -------------------- Jobs (async/polling) --------------------
+def _submit_job(in_path: str, language: Optional[str], engine: str) -> str:
+    job_id = str(uuid.uuid4())
+    _JOBS[job_id] = {"status": "pending"}
+    def _work():
+        _JOBS[job_id]["status"] = "running"
+        try:
+            result = _run_pipeline_sync(in_path, language, engine)
+            _JOBS[job_id]["result"] = result
+            _JOBS[job_id]["status"] = "done"
+        except Exception as e:
+            _JOBS[job_id]["status"] = "error"
+            _JOBS[job_id]["error"] = f"{type(e).__name__}: {str(e)}"
+        finally:
+            try: os.unlink(in_path)
+            except: pass
+    _EXECUTOR.submit(_work)
+    return job_id
+
+@app.get("/jobs/{job_id}", dependencies=[Depends(require_api_key)])
+def get_job(job_id: str):
+    job = _JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job not found")
+    return job
+
+# --- Transcribe endpoints (avec paramètre engine et mode async) ---
 @app.post("/transcribe/url", dependencies=[Depends(require_api_key)])
 async def transcribe_url(
     body: TranscribeUrlIn,
-    engine: Optional[str] = Query("auto", description="auto|cpu|gpu")
+    engine: Optional[str] = Query("auto", description="auto|cpu|gpu"),
+    async_mode: Optional[bool] = Query(None, description="true|false. Si None, FORCE_ASYNC s'applique")
 ):
     media_path = await _download_url_to_file(body.url, suffix=".bin")
+
+    # async explicite ou forcé par défaut → 202 + job_id
+    if (async_mode is True) or (async_mode is None and FORCE_ASYNC):
+        job_id = _submit_job(media_path, body.language, (engine or "auto"))
+        return JSONResponse(status_code=202, content={"ok": True, "job_id": job_id})
+
+    # sync (déconseillé derrière Cloudflare) avec "soft budget"
+    start = time.time()
     try:
-        return await _process_any(media_path, language=body.language, engine=engine)
+        result = _run_pipeline_sync(media_path, body.language, engine or "auto")
+        return JSONResponse(result)
     finally:
-        try: os.unlink(media_path)
-        except: pass
+        # si traitement court, on nettoie ici; sinon _run_pipeline_sync a déjà nettoyé wav interne
+        if time.time() - start <= CF_BUDGET_SECONDS:
+            try: os.unlink(media_path)
+            except: pass
 
 @app.post("/transcribe/file", dependencies=[Depends(require_api_key)])
 async def transcribe_file(
     file: UploadFile = File(...),
     language: Optional[str] = Form(None),
-    engine: Optional[str] = Form("auto")
+    engine: Optional[str] = Form("auto"),
+    async_mode: Optional[bool] = Form(None)
 ):
     suffix = os.path.splitext(file.filename or "")[1] or ".bin"
     tmp_fd, tmp_path = tempfile.mkstemp(suffix=suffix); os.close(tmp_fd)
     with open(tmp_path, "wb") as f:
         f.write(await file.read())
-    try:
-        return await _process_any(tmp_path, language=language, engine=engine)
-    finally:
-        try: os.unlink(tmp_path)
-        except: pass
 
-# -------------------- Core processing --------------------
+    # async par défaut
+    if (async_mode is True) or (async_mode is None and FORCE_ASYNC):
+        job_id = _submit_job(tmp_path, language, engine or "auto")
+        return JSONResponse(status_code=202, content={"ok": True, "job_id": job_id})
+
+    # sync (si vraiment nécessaire)
+    start = time.time()
+    try:
+        result = _run_pipeline_sync(tmp_path, language, engine or "auto")
+        return JSONResponse(result)
+    finally:
+        if time.time() - start <= CF_BUDGET_SECONDS:
+            try: os.unlink(tmp_path)
+            except: pass
+
+# -------------------- (Compat) Core processing ancien format --------------------
 async def _process_any(in_path: str, language: Optional[str] = None, engine: str = "auto"):
+    """
+    Gardé pour compat, non utilisé par les nouveaux endpoints (qui passent par _run_pipeline_sync).
+    """
     wav_path = _extract_audio_16k_mono(in_path)
     try:
         # 1) ASR
