@@ -4,9 +4,10 @@ import json
 import tempfile
 from typing import Optional, List, Dict, Any, Tuple
 import multiprocessing as mp
+import threading
 
 import uvicorn
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Header, Depends
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Header, Depends, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
@@ -51,7 +52,7 @@ DEVICE_INDEX = int(os.getenv("WHISPERX_DEVICE_INDEX", "0"))  # utile sur certain
 # Timeout (sec) pour tuer proprement le sous-processus GPU si blocage
 ASR_GPU_TIMEOUT = int(os.getenv("WHISPERX_ASR_GPU_TIMEOUT", "180"))
 
-app = FastAPI(title="whisperx-api", version="1.1.0")
+app = FastAPI(title="whisperx-api", version="1.2.0")
 
 _models_cache: Dict[str, Any] = {
     "asr_fw_cpu": None,         # WhisperModel CPU
@@ -156,18 +157,18 @@ def _ensure_diarization():
     return _models_cache["diar"]
 
 # -------------------- GPU subprocess runner --------------------
-def _gpu_asr_worker(args: Tuple[str, Optional[str], str, int, bool, int], pipe):
+def _gpu_asr_worker(args: Tuple[str, Optional[str], str, int, bool, int, str], pipe):
     """
     Lance l'ASR dans un sous-processus pour éviter de tuer le serveur si CUDA segfault/OOM.
     Renvoie via Pipe: {"ok": True, "segments": [...], "lang": "..."} ou {"ok": False, "error": "..."}.
     """
-    wav_path, language, model_name, beam_size, vad_filter, device_index = args
+    wav_path, language, model_name, beam_size, vad_filter, device_index, compute_type = args
     try:
         from faster_whisper import WhisperModel
         asr = WhisperModel(
             model_name,
             device="cuda",
-            compute_type=os.getenv("WHISPERX_COMPUTE_TYPE", "int8_float16"),
+            compute_type=compute_type,
             device_index=device_index,
         )
         segments_iter, info = asr.transcribe(
@@ -185,14 +186,17 @@ def _gpu_asr_worker(args: Tuple[str, Optional[str], str, int, bool, int], pipe):
 
 def _asr_transcribe_safe_gpu_then_cpu(wav_path: str, language: Optional[str]) -> Tuple[List[Dict[str, Any]], str, Dict[str, Any]]:
     """
-    Tente l'ASR sur GPU dans un sous-processus. Si le sous-processus meurt ou échoue,
+    Tente l'ASR sur GPU dans un sous-processus. Si le sous-processus meurt/échoue/timeout,
     retombe en CPU dans le process principal. Retourne (segments, lang, debug_info).
     """
     if DEVICE == "cuda":
         parent_conn, child_conn = mp.Pipe(duplex=False)
         p = mp.Process(
             target=_gpu_asr_worker,
-            args=((wav_path, language, WHISPERX_MODEL, BEAM_SIZE, VAD_FILTER, DEVICE_INDEX), child_conn),
+            args=((
+                wav_path, language, WHISPERX_MODEL, BEAM_SIZE, VAD_FILTER,
+                DEVICE_INDEX, os.getenv("WHISPERX_COMPUTE_TYPE", "int8_float16")
+            ), child_conn),
             daemon=True,
         )
         p.start()
@@ -255,34 +259,77 @@ def warmup(language: Optional[str] = "fr"):
         "engine": "faster-whisper + whisperx-align"
     }
 
+# ---- Warmup GPU non bloquant : précharge le modèle CTranslate2 en arrière-plan
+def _prefetch_gpu_model():
+    try:
+        from faster_whisper import WhisperModel
+        WhisperModel(
+            WHISPERX_MODEL,
+            device="cuda",
+            compute_type=os.getenv("WHISPERX_COMPUTE_TYPE", "int8_float16"),
+            device_index=DEVICE_INDEX,
+        )
+    except Exception:
+        # On ignore ici pour ne pas bloquer le démarrage ; l'inférence fera le fallback si besoin
+        pass
+
+@app.post("/warmup/gpu", dependencies=[Depends(require_api_key)])
+def warmup_gpu():
+    if DEVICE != "cuda":
+        return {"ok": False, "message": "CUDA indisponible sur ce pod"}
+    threading.Thread(target=_prefetch_gpu_model, daemon=True).start()
+    return {"ok": True, "started": True, "device": DEVICE, "compute_type": COMPUTE_TYPE}
+
+# --- Transcribe endpoints (avec paramètre engine)
 @app.post("/transcribe/url", dependencies=[Depends(require_api_key)])
-async def transcribe_url(body: TranscribeUrlIn):
+async def transcribe_url(
+    body: TranscribeUrlIn,
+    engine: Optional[str] = Query("auto", description="auto|cpu|gpu")
+):
     media_path = await _download_url_to_file(body.url, suffix=".bin")
     try:
-        return await _process_any(media_path, language=body.language)
+        return await _process_any(media_path, language=body.language, engine=engine)
     finally:
         try: os.unlink(media_path)
         except: pass
 
 @app.post("/transcribe/file", dependencies=[Depends(require_api_key)])
-async def transcribe_file(file: UploadFile = File(...), language: Optional[str] = Form(None)):
+async def transcribe_file(
+    file: UploadFile = File(...),
+    language: Optional[str] = Form(None),
+    engine: Optional[str] = Form("auto")
+):
     suffix = os.path.splitext(file.filename or "")[1] or ".bin"
     tmp_fd, tmp_path = tempfile.mkstemp(suffix=suffix); os.close(tmp_fd)
     with open(tmp_path, "wb") as f:
         f.write(await file.read())
     try:
-        return await _process_any(tmp_path, language=language)
+        return await _process_any(tmp_path, language=language, engine=engine)
     finally:
         try: os.unlink(tmp_path)
         except: pass
 
 # -------------------- Core processing --------------------
-async def _process_any(in_path: str, language: Optional[str] = None):
+async def _process_any(in_path: str, language: Optional[str] = None, engine: str = "auto"):
     wav_path = _extract_audio_16k_mono(in_path)
     try:
-        # 1) ASR (GPU en sous-processus, fallback CPU)
+        # 1) ASR
         try:
-            segments_list, lang, dbg = _asr_transcribe_safe_gpu_then_cpu(wav_path, language)
+            if engine.lower() == "cpu" or DEVICE != "cuda":
+                # CPU direct
+                asr_cpu = _ensure_cpu_model()
+                segments_iter, info = asr_cpu.transcribe(
+                    wav_path, language=language, vad_filter=VAD_FILTER, beam_size=BEAM_SIZE
+                )
+                segments_list = [{"start": float(s.start), "end": float(s.end), "text": (s.text or "").strip()}
+                                 for s in segments_iter]
+                lang = language or getattr(info, "language", "en")
+                dbg = {"engine": "cpu", "forced": engine.lower() == "cpu"}
+            elif engine.lower() in ("auto", "gpu"):
+                # GPU sous-processus + fallback CPU
+                segments_list, lang, dbg = _asr_transcribe_safe_gpu_then_cpu(wav_path, language)
+            else:
+                return JSONResponse(status_code=400, content={"ok": False, "error": "engine must be auto|cpu|gpu"})
         except Exception as e:
             return JSONResponse(status_code=500, content={
                 "ok": False, "stage": "asr", "error": str(e), "trace": traceback.format_exc()
