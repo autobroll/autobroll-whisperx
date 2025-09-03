@@ -21,9 +21,22 @@ except Exception:
 
 # -------------------- Config --------------------
 WHISPERX_MODEL = os.getenv("WHISPERX_MODEL", "large-v2")
+
+# Fallback automatique si CUDA demandé mais indisponible
 DEVICE_ENV = os.getenv("WHISPERX_DEVICE", "").strip().lower()
-DEVICE = DEVICE_ENV if DEVICE_ENV in ("cuda", "cpu") else ("cuda" if torch.cuda.is_available() else "cpu")
+if DEVICE_ENV == "cuda" and not torch.cuda.is_available():
+    DEVICE = "cpu"
+elif DEVICE_ENV in ("cuda", "cpu"):
+    DEVICE = DEVICE_ENV
+else:
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
 COMPUTE_TYPE = os.getenv("WHISPERX_COMPUTE_TYPE", "float16" if DEVICE == "cuda" else "int8")
+
+# Aligner sur CPU par défaut (peut être changé via env)
+ALIGN_DEVICE_ENV = os.getenv("WHISPERX_ALIGN_DEVICE", "").strip().lower()
+ALIGN_DEVICE = ALIGN_DEVICE_ENV if ALIGN_DEVICE_ENV in ("cuda", "cpu") else "cpu"
+
 DIARIZATION = os.getenv("WHISPERX_DIARIZATION", "false").lower() == "true"
 HF_TOKEN = os.getenv("HUGGINGFACE_TOKEN", os.getenv("HF_TOKEN", ""))
 
@@ -50,7 +63,7 @@ async def _download_url_to_file(url: str, suffix: str = "") -> str:
     async with aiohttp.ClientSession() as session:
         async with session.get(url) as resp:
             if resp.status != 200:
-                raise HTTPException(status_code=400, detail=f"Failed to fetch media: HTTP %s" % resp.status)
+                raise HTTPException(status_code=400, detail=f"Failed to fetch media: HTTP {resp.status}")
             with open(tmp_path, "wb") as f:
                 async for chunk in resp.content.iter_chunked(1 << 20):
                     f.write(chunk)
@@ -93,7 +106,8 @@ def _ensure_fw_model():
 def _get_align_model(language: str):
     if language in _models_cache["align"]:
         return _models_cache["align"][language]
-    align_model, metadata = whisperx.load_align_model(language_code=language, device=DEVICE)
+    # >>> Aligner sur ALIGN_DEVICE (souvent CPU) pour stabilité
+    align_model, metadata = whisperx.load_align_model(language_code=language, device=ALIGN_DEVICE)
     _models_cache["align"][language] = (align_model, metadata)
     return align_model, metadata
 
@@ -101,6 +115,7 @@ def _ensure_diarization():
     if not DIARIZATION:
         return None
     if _models_cache["diar"] is None:
+        # Tu peux aussi forcer la diarisation en CPU en changeant le device ici si souhaité
         _models_cache["diar"] = whisperx.DiarizationPipeline(use_auth_token=HF_TOKEN, device=DEVICE)
     return _models_cache["diar"]
 
@@ -156,6 +171,7 @@ def health():
     return {
         "ok": True,
         "device": DEVICE,
+        "align_device": ALIGN_DEVICE,
         "model": WHISPERX_MODEL,
         "compute_type": COMPUTE_TYPE,
         "diarization": DIARIZATION,
@@ -178,6 +194,7 @@ def warmup(language: Optional[str] = "fr"):
         "ok": True,
         "warmed": True,
         "device": DEVICE,
+        "align_device": ALIGN_DEVICE,
         "model": WHISPERX_MODEL,
         "language": language or "fr",
         "engine": "faster-whisper + whisperx-align"
@@ -229,14 +246,14 @@ async def _process_any(in_path: str, language: Optional[str] = None):
             })
         lang = language or getattr(info, "language", "en")
 
-        # 2) Alignement mot-à-mot via WhisperX
+        # 2) Alignement mot-à-mot via WhisperX (sur ALIGN_DEVICE)
         align_model, metadata = _get_align_model(lang)
         aligned = whisperx.align(
             segments_list,
             align_model,
             metadata,
             wav_path,
-            DEVICE,
+            ALIGN_DEVICE,
             return_char_alignments=False
         )
 
