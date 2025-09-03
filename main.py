@@ -37,6 +37,10 @@ COMPUTE_TYPE = os.getenv("WHISPERX_COMPUTE_TYPE", "float16" if DEVICE == "cuda" 
 ALIGN_DEVICE_ENV = os.getenv("WHISPERX_ALIGN_DEVICE", "").strip().lower()
 ALIGN_DEVICE = ALIGN_DEVICE_ENV if ALIGN_DEVICE_ENV in ("cuda", "cpu") else "cpu"
 
+# Paramètres d'inférence contrôlables par ENV
+BEAM_SIZE = int(os.getenv("WHISPERX_BEAM_SIZE", "5"))
+VAD_FILTER = os.getenv("WHISPERX_VAD_FILTER", "false").lower() == "true"
+
 DIARIZATION = os.getenv("WHISPERX_DIARIZATION", "false").lower() == "true"
 HF_TOKEN = os.getenv("HUGGINGFACE_TOKEN", os.getenv("HF_TOKEN", ""))
 
@@ -234,8 +238,8 @@ async def _process_any(in_path: str, language: Optional[str] = None):
         segments_iter, info = asr.transcribe(
             wav_path,
             language=language,
-            vad_filter=False,        # <- VAD désactivé
-            beam_size=5
+            vad_filter=VAD_FILTER,
+            beam_size=BEAM_SIZE
         )
         segments_list = []
         for seg in segments_iter:
