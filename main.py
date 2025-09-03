@@ -11,6 +11,7 @@ from pydantic import BaseModel
 import torch
 import ffmpeg
 import aiohttp
+import traceback  # <-- pour renvoyer l'erreur proprement (anti-502)
 
 import whisperx  # align + diarization
 try:
@@ -235,12 +236,24 @@ async def _process_any(in_path: str, language: Optional[str] = None):
     try:
         # 1) ASR via faster-whisper (aucun VAD)
         asr = _ensure_fw_model()
-        segments_iter, info = asr.transcribe(
-            wav_path,
-            language=language,
-            vad_filter=VAD_FILTER,
-            beam_size=BEAM_SIZE
-        )
+        try:
+            segments_iter, info = asr.transcribe(
+                wav_path,
+                language=language,
+                vad_filter=VAD_FILTER,
+                beam_size=BEAM_SIZE
+            )
+        except Exception as e:
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "ok": False,
+                    "stage": "asr.transcribe",
+                    "error": str(e),
+                    "trace": traceback.format_exc()
+                }
+            )
+
         segments_list = []
         for seg in segments_iter:
             segments_list.append({
@@ -251,22 +264,44 @@ async def _process_any(in_path: str, language: Optional[str] = None):
         lang = language or getattr(info, "language", "en")
 
         # 2) Alignement mot-à-mot via WhisperX (sur ALIGN_DEVICE)
-        align_model, metadata = _get_align_model(lang)
-        aligned = whisperx.align(
-            segments_list,
-            align_model,
-            metadata,
-            wav_path,
-            ALIGN_DEVICE,
-            return_char_alignments=False
-        )
+        try:
+            align_model, metadata = _get_align_model(lang)
+            aligned = whisperx.align(
+                segments_list,
+                align_model,
+                metadata,
+                wav_path,
+                ALIGN_DEVICE,
+                return_char_alignments=False
+            )
+        except Exception as e:
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "ok": False,
+                    "stage": "whisperx.align",
+                    "error": str(e),
+                    "trace": traceback.format_exc()
+                }
+            )
 
         # 3) Diarisation (optionnelle)
         if DIARIZATION:
-            diar = _ensure_diarization()
-            if diar is not None:
-                diar_segments = diar(wav_path)
-                aligned = whisperx.assign_word_speakers(diar_segments, aligned)
+            try:
+                diar = _ensure_diarization()
+                if diar is not None:
+                    diar_segments = diar(wav_path)
+                    aligned = whisperx.assign_word_speakers(diar_segments, aligned)
+            except Exception as e:
+                return JSONResponse(
+                    status_code=500,
+                    content={
+                        "ok": False,
+                        "stage": "diarization",
+                        "error": str(e),
+                        "trace": traceback.format_exc()
+                    }
+                )
 
         # 4) Sorties (VTT / SRT)
         merged = _merge_words_into_segments(aligned)
