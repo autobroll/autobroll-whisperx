@@ -11,28 +11,19 @@ from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Header, Depe
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel
 
-import torch
+# ⚠️ Import lourds (torch / whisperx / faster_whisper) retirés du top-level
+# pour éviter tout crash avant que /ping réponde.
 import ffmpeg
 import aiohttp
 import traceback
-
-import whisperx  # align + diarization
-try:
-    from faster_whisper import WhisperModel  # ASR direct, sans VAD
-    _FW_OK = True
-except Exception:
-    _FW_OK = False
+import importlib
 
 # -------------------- Config --------------------
 WHISPERX_MODEL = os.getenv("WHISPERX_MODEL", "large-v2")
 
+# Ne pas importer torch ici. On respecte simplement la config.
 DEVICE_ENV = os.getenv("WHISPERX_DEVICE", "").strip().lower()
-if DEVICE_ENV == "cuda" and not torch.cuda.is_available():
-    DEVICE = "cpu"
-elif DEVICE_ENV in ("cuda", "cpu"):
-    DEVICE = DEVICE_ENV
-else:
-    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DEVICE = DEVICE_ENV if DEVICE_ENV in ("cuda", "cpu") else "cuda"
 
 COMPUTE_TYPE = os.getenv("WHISPERX_COMPUTE_TYPE", "float16" if DEVICE == "cuda" else "int8")
 
@@ -52,13 +43,31 @@ DEVICE_INDEX = int(os.getenv("WHISPERX_DEVICE_INDEX", "0"))  # utile sur certain
 # Timeout (sec) pour tuer proprement le sous-processus GPU si blocage
 ASR_GPU_TIMEOUT = int(os.getenv("WHISPERX_ASR_GPU_TIMEOUT", "180"))
 
-app = FastAPI(title="whisperx-api", version="1.2.1")
+app = FastAPI(title="whisperx-api", version="1.2.2")
 
 _models_cache: Dict[str, Any] = {
     "asr_fw_cpu": None,         # WhisperModel CPU
     "align": {},                # language -> (align_model, metadata)
     "diar": None
 }
+
+# Lazy modules (chargés à la demande)
+_lazy_modules: Dict[str, Any] = {
+    "whisperx": None,
+    "faster_whisper": None,
+}
+
+def _wx():
+    """Lazy import de whisperx."""
+    if _lazy_modules["whisperx"] is None:
+        _lazy_modules["whisperx"] = importlib.import_module("whisperx")
+    return _lazy_modules["whisperx"]
+
+def _fw():
+    """Lazy import de faster_whisper."""
+    if _lazy_modules["faster_whisper"] is None:
+        _lazy_modules["faster_whisper"] = importlib.import_module("faster_whisper")
+    return _lazy_modules["faster_whisper"]
 
 # -------------------- Auth helper --------------------
 def require_api_key(x_api_key: Optional[str] = Header(default=None, alias="X-API-Key")):
@@ -159,8 +168,10 @@ def _merge_words_into_segments(aligned_result: Dict[str, Any]) -> List[Dict[str,
 
 # -------------------- Model helpers --------------------
 def _ensure_cpu_model():
-    if not _FW_OK:
-        raise HTTPException(status_code=500, detail="faster-whisper indisponible")
+    try:
+        WhisperModel = _fw().WhisperModel
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"faster-whisper indisponible: {e}")
     if _models_cache["asr_fw_cpu"] is None:
         _models_cache["asr_fw_cpu"] = WhisperModel(
             WHISPERX_MODEL, device="cpu", compute_type="int8"
@@ -170,7 +181,8 @@ def _ensure_cpu_model():
 def _get_align_model(language: str):
     if language in _models_cache["align"]:
         return _models_cache["align"][language]
-    align_model, metadata = whisperx.load_align_model(language_code=language, device=ALIGN_DEVICE)
+    wx = _wx()
+    align_model, metadata = wx.load_align_model(language_code=language, device=ALIGN_DEVICE)
     _models_cache["align"][language] = (align_model, metadata)
     return align_model, metadata
 
@@ -178,14 +190,15 @@ def _ensure_diarization():
     if not DIARIZATION:
         return None
     if _models_cache["diar"] is None:
-        _models_cache["diar"] = whisperx.DiarizationPipeline(use_auth_token=HF_TOKEN, device=ALIGN_DEVICE)
+        wx = _wx()
+        _models_cache["diar"] = wx.DiarizationPipeline(use_auth_token=HF_TOKEN, device=ALIGN_DEVICE)
     return _models_cache["diar"]
 
 # -------------------- GPU subprocess runner --------------------
 def _gpu_asr_worker(args: Tuple[str, Optional[str], str, int, bool, int, str], pipe):
     wav_path, language, model_name, beam_size, vad_filter, device_index, compute_type = args
     try:
-        from faster_whisper import WhisperModel
+        from faster_whisper import WhisperModel  # import local au worker
         asr = WhisperModel(
             model_name,
             device="cuda",
@@ -259,7 +272,7 @@ def warmup(language: Optional[str] = "fr"):
 
 def _prefetch_gpu_model():
     try:
-        from faster_whisper import WhisperModel
+        WhisperModel = _fw().WhisperModel
         WhisperModel(
             WHISPERX_MODEL,
             device="cuda",
@@ -329,7 +342,8 @@ async def _process_any(in_path: str, language: Optional[str] = None, engine: str
 
         try:
             align_model, metadata = _get_align_model(lang)
-            aligned = whisperx.align(
+            wx = _wx()
+            aligned = wx.align(
                 segments_list, align_model, metadata, wav_path, ALIGN_DEVICE, return_char_alignments=False
             )
         except Exception as e:
@@ -341,8 +355,9 @@ async def _process_any(in_path: str, language: Optional[str] = None, engine: str
             try:
                 diar = _ensure_diarization()
                 if diar is not None:
+                    wx = _wx()
                     diar_segments = diar(wav_path)
-                    aligned = whisperx.assign_word_speakers(diar_segments, aligned)
+                    aligned = wx.assign_word_speakers(diar_segments, aligned)
             except Exception as e:
                 return JSONResponse(status_code=500, content={
                     "ok": False, "stage": "diarization", "error": str(e), "trace": traceback.format_exc(), "dbg": dbg
