@@ -8,15 +8,15 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-# Outils & ffmpeg (pour l’audio)
+# Outils & ffmpeg (pour l’audio) + libsndfile pour soundfile/torchaudio
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3-venv ffmpeg git git-lfs ca-certificates && \
+    python3-venv ffmpeg git git-lfs ca-certificates libsndfile1 && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# ⚠️ IMPORTANT : on ne réinstalle PAS torch/torchaudio ici (déjà fournis par l'image)
-# Installe seulement tes deps applicatives
+# ⚠️ Torch/Torchaudio sont déjà fournis par l'image — ne pas les réinstaller
+# Install uniquement les deps applicatives (avec ton constraints.txt)
 COPY requirements.txt constraints.txt ./
 RUN python -m pip install --upgrade pip setuptools wheel && \
     pip install --no-cache-dir -r requirements.txt -c constraints.txt
@@ -24,7 +24,7 @@ RUN python -m pip install --upgrade pip setuptools wheel && \
 # Code
 COPY . .
 
-# Caches (pointeront vers le volume GCS si tu le montes sur /cache)
+# Caches (pointez /cache vers un bucket GCS monté en volume pour la persistance)
 ENV HF_HOME=/cache/hf \
     TRANSFORMERS_CACHE=/cache/hf \
     XDG_CACHE_HOME=/cache \
@@ -34,7 +34,7 @@ ENV HF_HOME=/cache/hf \
     TOKENIZERS_PARALLELISM=false \
     CT2_FORCE_CPU_ISA=AVX2
 
-# Paramètres par défaut (tu peux override dans Cloud Run)
+# Paramètres par défaut (override dans Cloud Run si besoin)
 ENV PORT=8011 \
     API_KEY=autobroll_secret_1 \
     WHISPERX_MODEL=large-v3 \
@@ -43,7 +43,7 @@ ENV PORT=8011 \
     WHISPERX_COMPUTE_TYPE=float16 \
     WHISPERX_DIARIZATION=false \
     WHISPERX_BEAM_SIZE=1 \
-    WHISPERX_VAD_FILTER=true \
+    WHISPERX_VAD_FILTER=false \
     WHISPERX_DEVICE_INDEX=0 \
     WHISPERX_ASR_GPU_TIMEOUT=240
 
