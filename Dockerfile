@@ -1,5 +1,4 @@
-# === PyTorch + CUDA 12.1 + cuDNN 9 (runtime) ===
-# Aligne Torch / CUDA / cuDNN pour éviter tout fallback CPU
+# === Base PyTorch alignée CUDA 12.1 + cuDNN 9 ===
 FROM pytorch/pytorch:2.4.1-cuda12.1-cudnn9-runtime
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -8,15 +7,14 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-# Outils & ffmpeg (pour l’audio) + libsndfile pour soundfile/torchaudio
+# Outils + ffmpeg (audio)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3-venv ffmpeg git git-lfs ca-certificates libsndfile1 && \
+    python3-venv ffmpeg git git-lfs ca-certificates curl && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# ⚠️ Torch/Torchaudio sont déjà fournis par l'image — ne pas les réinstaller
-# Install uniquement les deps applicatives (avec ton constraints.txt)
+# Dépendances applis (torch/torchaudio déjà fournis par l'image)
 COPY requirements.txt constraints.txt ./
 RUN python -m pip install --upgrade pip setuptools wheel && \
     pip install --no-cache-dir -r requirements.txt -c constraints.txt
@@ -24,17 +22,37 @@ RUN python -m pip install --upgrade pip setuptools wheel && \
 # Code
 COPY . .
 
-# Caches (pointez /cache vers un bucket GCS monté en volume pour la persistance)
-ENV HF_HOME=/cache/hf \
-    TRANSFORMERS_CACHE=/cache/hf \
-    XDG_CACHE_HOME=/cache \
-    TORCH_HOME=/cache/torch \
-    NUMBA_CACHE_DIR=/cache/numba \
-    CUDA_CACHE_PATH=/cache/cuda \
+# Caches LOCAUX (pas de bucket) — on bake dans /root/.cache
+ENV HF_HOME=/root/.cache/huggingface \
+    TRANSFORMERS_CACHE=/root/.cache/huggingface \
+    XDG_CACHE_HOME=/root/.cache \
+    TORCH_HOME=/root/.cache/torch \
+    NUMBA_CACHE_DIR=/root/.cache/numba \
+    CUDA_CACHE_PATH=/root/.cache/cuda \
     TOKENIZERS_PARALLELISM=false \
     CT2_FORCE_CPU_ISA=AVX2
 
-# Paramètres par défaut (override dans Cloud Run si besoin)
+# ---------- Prefetch des modèles pour éviter tout download en prod ----------
+
+# 1) Poids CTranslate2 de faster-whisper (large-v3) – téléchargés en CPU au build
+#    => À l'exécution on chargera en CUDA sans re-télécharger.
+RUN python - <<'PY'
+import os
+from faster_whisper import WhisperModel
+os.makedirs(os.environ.get("HF_HOME","/root/.cache/huggingface"), exist_ok=True)
+# télécharge en CPU (int8) juste pour remplir le cache
+WhisperModel("large-v3", device="cpu", compute_type="int8")
+print("Prefetch faster-whisper large-v3 OK")
+PY
+
+# 2) Checkpoint torchaudio FR (360 Mo) – placé dans TORCH_HOME
+RUN mkdir -p /root/.cache/torch/hub/checkpoints && \
+    curl -L \
+  -o /root/.cache/torch/hub/checkpoints/wav2vec2_voxpopuli_base_10k_asr_fr.pt \
+     https://download.pytorch.org/torchaudio/models/wav2vec2_voxpopuli_base_10k_asr_fr.pt && \
+    echo "Prefetch torchaudio wav2vec2 FR OK"
+
+# Paramètres par défaut (surclassables dans Cloud Run)
 ENV PORT=8011 \
     API_KEY=autobroll_secret_1 \
     WHISPERX_MODEL=large-v3 \
@@ -43,7 +61,7 @@ ENV PORT=8011 \
     WHISPERX_COMPUTE_TYPE=float16 \
     WHISPERX_DIARIZATION=false \
     WHISPERX_BEAM_SIZE=1 \
-    WHISPERX_VAD_FILTER=false \
+    WHISPERX_VAD_FILTER=true \
     WHISPERX_DEVICE_INDEX=0 \
     WHISPERX_ASR_GPU_TIMEOUT=240
 
