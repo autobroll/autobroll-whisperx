@@ -1,5 +1,6 @@
-# Image CUDA 12.1 + cuDNN 8 (runtime) pour Ubuntu 22.04
-FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
+# === PyTorch + CUDA 12.1 + cuDNN 9 (runtime) ===
+# Aligne Torch / CUDA / cuDNN pour éviter tout fallback CPU
+FROM pytorch/pytorch:2.4.1-cuda12.1-cudnn9-runtime
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
@@ -7,61 +8,44 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-# Python + ffmpeg (indispensable pour l'extraction audio)
+# Outils & ffmpeg (pour l’audio)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 python3-pip python3-venv ffmpeg git git-lfs ca-certificates && \
+    python3-venv ffmpeg git git-lfs ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# --- Torch/Torchaudio en cu121 (compatibles avec cette image) ---
-RUN python3 -m pip install --upgrade pip setuptools wheel && \
-    pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu121 \
-        torch==2.1.0+cu121 torchaudio==2.1.0+cu121
-
-# --- Dépendances de l'app ---
+# ⚠️ IMPORTANT : on ne réinstalle PAS torch/torchaudio ici (déjà fournis par l'image)
+# Installe seulement tes deps applicatives
 COPY requirements.txt constraints.txt ./
-RUN echo "===== requirements.txt =====" && cat requirements.txt && \
-    echo "===== constraints.txt =====" && cat constraints.txt && \
+RUN python -m pip install --upgrade pip setuptools wheel && \
     pip install --no-cache-dir -r requirements.txt -c constraints.txt
 
-# --- Code ---
+# Code
 COPY . .
 
-# --- Cache HuggingFace stable (utile pour éviter les re-downloads) ---
-ENV HF_HOME=/root/.cache/huggingface \
-    TRANSFORMERS_CACHE=/root/.cache/huggingface \
-    # CTranslate2: force une ISA CPU correcte quand on build sans GPU (sans incidence à l'exécution GPU)
+# Caches (pointeront vers le volume GCS si tu le montes sur /cache)
+ENV HF_HOME=/cache/hf \
+    TRANSFORMERS_CACHE=/cache/hf \
+    XDG_CACHE_HOME=/cache \
+    TORCH_HOME=/cache/torch \
+    NUMBA_CACHE_DIR=/cache/numba \
+    CUDA_CACHE_PATH=/cache/cuda \
+    TOKENIZERS_PARALLELISM=false \
     CT2_FORCE_CPU_ISA=AVX2
 
-# --- Variables par défaut (override via RunPod) ---
-# Astuce: on met des valeurs "raisonnables" pour GPU; vous pouvez les surcharger à l'exécution.
+# Paramètres par défaut (tu peux override dans Cloud Run)
 ENV PORT=8011 \
     API_KEY=autobroll_secret_1 \
-    WHISPERX_MODEL=medium \
+    WHISPERX_MODEL=large-v3 \
     WHISPERX_DEVICE=cuda \
-    WHISPERX_ALIGN_DEVICE=cpu \
-    WHISPERX_COMPUTE_TYPE=int8_float16 \
+    WHISPERX_ALIGN_DEVICE=cuda \
+    WHISPERX_COMPUTE_TYPE=float16 \
     WHISPERX_DIARIZATION=false \
     WHISPERX_BEAM_SIZE=1 \
     WHISPERX_VAD_FILTER=true \
     WHISPERX_DEVICE_INDEX=0 \
-    WHISPERX_ASR_GPU_TIMEOUT=180
-
-# --- Prefetch du modèle Faster-Whisper pendant le build ---
-# On télécharge les poids CT2 à l'étape build (en "cpu") pour les embarquer dans l'image.
-# Au runtime, le même modèle sera chargé en "cuda" sans re-télécharger.
-RUN python3 - <<'PY'
-import os
-from faster_whisper import WhisperModel
-model = os.environ.get("WHISPERX_MODEL", "medium")
-compute = os.environ.get("WHISPERX_COMPUTE_TYPE", "int8_float16")
-# Téléchargement des poids CT2 dans HF cache (CPU suffit au build)
-WhisperModel(model, device="cpu", compute_type="int8")
-print("Prefetch done for:", model, "(cpu,int8)")
-PY
+    WHISPERX_ASR_GPU_TIMEOUT=240
 
 EXPOSE 8011
-
-# Lancement API (respecte $PORT)
-CMD ["bash", "-lc", "uvicorn main:app --host 0.0.0.0 --port ${PORT} --proxy-headers --log-level info"]
+CMD ["bash","-lc","uvicorn main:app --host 0.0.0.0 --port ${PORT} --proxy-headers --log-level info"]
