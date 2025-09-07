@@ -69,6 +69,11 @@ def _fw():
         _lazy_modules["faster_whisper"] = importlib.import_module("faster_whisper")
     return _lazy_modules["faster_whisper"]
 
+# -------------------- Warmup flags --------------------
+WARMED_CPU = False
+WARMED_GPU = False
+WARMUP_LOCK = threading.Lock()
+
 # -------------------- Auth helper --------------------
 def require_api_key(x_api_key: Optional[str] = Header(default=None, alias="X-API-Key")):
     if API_KEY and x_api_key != API_KEY:
@@ -97,6 +102,8 @@ def health():
         "auth_required": bool(API_KEY),
         "engine": "faster-whisper + whisperx-align",
         "device_index": DEVICE_INDEX,
+        "warmed_cpu": WARMED_CPU,
+        "warmed_gpu": WARMED_GPU,
     }
 
 # -------------------- Utils --------------------
@@ -194,6 +201,30 @@ def _ensure_diarization():
         _models_cache["diar"] = wx.DiarizationPipeline(use_auth_token=HF_TOKEN, device=ALIGN_DEVICE)
     return _models_cache["diar"]
 
+# -------------------- Warmup helpers --------------------
+def _warmup_cpu():
+    """Précharge aligner (en, fr) + diar (si activée) en non-bloquant."""
+    global WARMED_CPU
+    with WARMUP_LOCK:
+        if WARMED_CPU:
+            return
+        # asr cpu (utile si fallback)
+        _ensure_cpu_model()
+        # aligners
+        for _lang in ("fr", "en"):
+            try:
+                _get_align_model(_lang)
+            except Exception as e:
+                print(f"[warmup-cpu] align {_lang} -> {e}")
+        # diarisation (optionnelle)
+        if DIARIZATION:
+            try:
+                _ensure_diarization()
+            except Exception as e:
+                print(f"[warmup-cpu] diar -> {e}")
+        WARMED_CPU = True
+        print("[warmup-cpu] done")
+
 # -------------------- GPU subprocess runner --------------------
 def _gpu_asr_worker(args: Tuple[str, Optional[str], str, int, bool, int, str], pipe):
     wav_path, language, model_name, beam_size, vad_filter, device_index, compute_type = args
@@ -260,17 +291,18 @@ class TranscribeUrlIn(BaseModel):
 # -------------------- Routes --------------------
 @app.post("/warmup", dependencies=[Depends(require_api_key)])
 def warmup(language: Optional[str] = "fr"):
-    _ensure_cpu_model()
-    _get_align_model(language or "fr")
-    if DIARIZATION:
-        _ensure_diarization()
+    # lance le warmup CPU en thread (non bloquant)
+    threading.Thread(target=_warmup_cpu, daemon=True).start()
     return {
-        "ok": True, "warmed": True, "device": DEVICE, "align_device": ALIGN_DEVICE,
+        "ok": True, "started": True, "device": DEVICE, "align_device": ALIGN_DEVICE,
         "model": WHISPERX_MODEL, "language": language or "fr",
-        "engine": "faster-whisper + whisperx-align"
+        "engine": "faster-whisper + whisperx-align",
+        "warmed_cpu": WARMED_CPU, "warmed_gpu": WARMED_GPU
     }
 
 def _prefetch_gpu_model():
+    """Charge le modèle ASR GPU pour éliminer la latence du 1er appel."""
+    global WARMED_GPU
     try:
         WhisperModel = _fw().WhisperModel
         WhisperModel(
@@ -279,13 +311,17 @@ def _prefetch_gpu_model():
             compute_type=os.getenv("WHISPERX_COMPUTE_TYPE", "int8_float16"),
             device_index=DEVICE_INDEX,
         )
-    except Exception:
-        pass
+        WARMED_GPU = True
+        print("[warmup-gpu] done")
+    except Exception as e:
+        print("[warmup-gpu] failed:", e)
 
 @app.post("/warmup/gpu", dependencies=[Depends(require_api_key)])
 def warmup_gpu():
     if DEVICE != "cuda":
         return {"ok": False, "message": "CUDA indisponible sur ce pod"}
+    # déclenche CPU + GPU warmups en tâche de fond
+    threading.Thread(target=_warmup_cpu, daemon=True).start()
     threading.Thread(target=_prefetch_gpu_model, daemon=True).start()
     return {"ok": True, "started": True, "device": DEVICE, "compute_type": COMPUTE_TYPE}
 
@@ -319,6 +355,12 @@ async def transcribe_file(
 
 # -------------------- Core processing --------------------
 async def _process_any(in_path: str, language: Optional[str] = None, engine: str = "auto"):
+    # warmup opportuniste (ne bloque pas)
+    if not WARMED_CPU:
+        threading.Thread(target=_warmup_cpu, daemon=True).start()
+    if (engine.lower() in ("auto", "gpu")) and (DEVICE == "cuda") and (not WARMED_GPU):
+        threading.Thread(target=_prefetch_gpu_model, daemon=True).start()
+
     wav_path = _extract_audio_16k_mono(in_path)
     try:
         try:
