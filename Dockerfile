@@ -30,7 +30,8 @@ ENV HF_HOME=/root/.cache/huggingface \
     NUMBA_CACHE_DIR=/root/.cache/numba \
     CUDA_CACHE_PATH=/root/.cache/cuda \
     TOKENIZERS_PARALLELISM=false \
-    CT2_FORCE_CPU_ISA=AVX2
+    CT2_FORCE_CPU_ISA=AVX2 \
+    LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH}
 
 # ---------- Prefetch des modèles pour éviter tout download en prod ----------
 
@@ -51,6 +52,20 @@ RUN mkdir -p /root/.cache/torch/hub/checkpoints && \
   -o /root/.cache/torch/hub/checkpoints/wav2vec2_voxpopuli_base_10k_asr_fr.pt \
      https://download.pytorch.org/torchaudio/models/wav2vec2_voxpopuli_base_10k_asr_fr.pt && \
     echo "Prefetch torchaudio wav2vec2 FR OK"
+
+# 3) Prefetch des modèles d’alignement WhisperX (en + fr)
+#    On les télécharge en CPU au build pour remplir HF_HOME/TRANSFORMERS_CACHE.
+RUN python - <<'PY'
+import os
+import whisperx
+os.makedirs(os.environ.get("HF_HOME","/root/.cache/huggingface"), exist_ok=True)
+for lang in ["en", "fr"]:
+    try:
+        m, meta = whisperx.load_align_model(language_code=lang, device="cpu")
+        print("Prefetch whisperx aligner OK:", lang, meta)
+    except Exception as e:
+        print("Prefetch whisperx aligner FAILED for", lang, "->", e)
+PY
 
 # Paramètres par défaut (surclassables dans Cloud Run)
 ENV PORT=8011 \
