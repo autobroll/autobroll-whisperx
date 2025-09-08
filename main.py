@@ -11,8 +11,7 @@ from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Header, Depe
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel
 
-# ⚠️ Import lourds (torch / whisperx / faster_whisper) retirés du top-level
-# pour éviter tout crash avant que /ping réponde.
+# ⚠️ Imports lourds (torch / whisperx / faster_whisper) retirés du top-level
 import ffmpeg
 import aiohttp
 import traceback
@@ -39,11 +38,13 @@ HF_TOKEN = os.getenv("HUGGINGFACE_TOKEN", os.getenv("HF_TOKEN", ""))
 API_KEY = os.getenv("API_KEY", "")
 
 DEVICE_INDEX = int(os.getenv("WHISPERX_DEVICE_INDEX", "0"))  # utile sur certaines stacks
-
-# Timeout (sec) pour tuer proprement le sous-processus GPU si blocage
 ASR_GPU_TIMEOUT = int(os.getenv("WHISPERX_ASR_GPU_TIMEOUT", "180"))
 
-app = FastAPI(title="whisperx-api", version="1.2.2")
+# NEW: switch rapide/précis + threads CPU
+USE_WHISPERX_ALIGN = os.getenv("USE_WHISPERX_ALIGN", "true").lower() == "true"
+FWS_CPU_THREADS = int(os.getenv("FWS_CPU_THREADS", "0"))  # 0 = auto (laisser CT2 choisir)
+
+app = FastAPI(title="whisperx-api", version="1.3.0")
 
 _models_cache: Dict[str, Any] = {
     "asr_fw_cpu": None,         # WhisperModel CPU
@@ -79,15 +80,13 @@ def require_api_key(x_api_key: Optional[str] = Header(default=None, alias="X-API
     if API_KEY and x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
-# -------------------- Liveness / Health for Runpod --------------------
+# -------------------- Liveness / Health --------------------
 @app.get("/", response_class=PlainTextResponse)
 def root():
-    # Petit endpoint pour tester depuis le navigateur
     return "whisperx-api ok"
 
 @app.get("/ping", response_class=PlainTextResponse)
 def ping():
-    # Ultra rapide: utilisé par le Load Balancer (PORT_HEALTH)
     return "pong"
 
 @app.get("/health")
@@ -100,10 +99,12 @@ def health():
         "compute_type": COMPUTE_TYPE,
         "diarization": DIARIZATION,
         "auth_required": bool(API_KEY),
-        "engine": "faster-whisper + whisperx-align",
+        "engine": "faster-whisper + (optional) whisperx-align",
         "device_index": DEVICE_INDEX,
         "warmed_cpu": WARMED_CPU,
         "warmed_gpu": WARMED_GPU,
+        "use_whisperx_align": USE_WHISPERX_ALIGN,
+        "fws_cpu_threads": FWS_CPU_THREADS,
     }
 
 # -------------------- Utils --------------------
@@ -163,13 +164,20 @@ def _merge_words_into_segments(aligned_result: Dict[str, Any]) -> List[Dict[str,
             "words": []
         }
         for w in seg.get("words", []) or []:
-            if w.get("word") is None: continue
-            s["words"].append({
-                "text": w.get("word"),
-                "start": float(w.get("start", s["start"])) if w.get("start") is not None else None,
-                "end": float(w.get("end", s["end"])) if w.get("end") is not None else None,
-                "prob": float(w.get("probability", 0)) if w.get("probability") is not None else None
-            })
+            if w.get("word") is not None:  # whisperx format
+                s["words"].append({
+                    "text": w.get("word"),
+                    "start": float(w.get("start", s["start"])) if w.get("start") is not None else None,
+                    "end": float(w.get("end", s["end"])) if w.get("end") is not None else None,
+                    "prob": float(w.get("probability", 0)) if w.get("probability") is not None else None
+                })
+            elif w.get("text") is not None:  # faster-whisper words format
+                s["words"].append({
+                    "text": w.get("text"),
+                    "start": float(w.get("start", s["start"])) if w.get("start") is not None else None,
+                    "end": float(w.get("end", s["end"])) if w.get("end") is not None else None,
+                    "prob": float(w.get("prob", 0)) if w.get("prob") is not None else None
+                })
         segs.append(s)
     return segs
 
@@ -180,9 +188,11 @@ def _ensure_cpu_model():
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"faster-whisper indisponible: {e}")
     if _models_cache["asr_fw_cpu"] is None:
-        _models_cache["asr_fw_cpu"] = WhisperModel(
-            WHISPERX_MODEL, device="cpu", compute_type="int8"
-        )
+        kwargs = {"device": "cpu", "compute_type": "int8"}
+        if FWS_CPU_THREADS > 0:
+            kwargs["cpu_threads"] = FWS_CPU_THREADS  # = nb de vCPU
+            kwargs["num_workers"] = 1
+        _models_cache["asr_fw_cpu"] = WhisperModel(WHISPERX_MODEL, **kwargs)
     return _models_cache["asr_fw_cpu"]
 
 def _get_align_model(language: str):
@@ -203,20 +213,17 @@ def _ensure_diarization():
 
 # -------------------- Warmup helpers --------------------
 def _warmup_cpu():
-    """Précharge aligner (en, fr) + diar (si activée) en non-bloquant."""
+    """Précharge aligner (en, fr) + diar (si activée) et modèle CPU (fallback)."""
     global WARMED_CPU
     with WARMUP_LOCK:
         if WARMED_CPU:
             return
-        # asr cpu (utile si fallback)
         _ensure_cpu_model()
-        # aligners
         for _lang in ("fr", "en"):
             try:
                 _get_align_model(_lang)
             except Exception as e:
                 print(f"[warmup-cpu] align {_lang} -> {e}")
-        # diarisation (optionnelle)
         if DIARIZATION:
             try:
                 _ensure_diarization()
@@ -236,11 +243,25 @@ def _gpu_asr_worker(args: Tuple[str, Optional[str], str, int, bool, int, str], p
             compute_type=compute_type,
             device_index=device_index,
         )
+        # word_timestamps si on N'UTILISE PAS l'align WhisperX
+        word_ts = os.getenv("USE_WHISPERX_ALIGN","true").lower() != "true"
         segments_iter, info = asr.transcribe(
-            wav_path, language=language, vad_filter=vad_filter, beam_size=beam_size
+            wav_path,
+            language=language,
+            vad_filter=vad_filter,
+            beam_size=beam_size,
+            word_timestamps=word_ts
         )
-        segs = [{"start": float(s.start), "end": float(s.end), "text": (s.text or "").strip()}
-                for s in segments_iter]
+        segs = []
+        for s in segments_iter:
+            seg = {"start": float(s.start), "end": float(s.end), "text": (s.text or "").strip()}
+            if word_ts and getattr(s, "words", None):
+                seg["words"] = [
+                    {"text": w.word, "start": float(w.start), "end": float(w.end),
+                     "prob": float(w.probability) if w.probability is not None else None}
+                    for w in s.words
+                ]
+            segs.append(seg)
         lang = language or getattr(info, "language", "en")
         pipe.send({"ok": True, "segments": segs, "lang": lang})
     except Exception as e:
@@ -274,12 +295,25 @@ def _asr_transcribe_safe_gpu_then_cpu(wav_path: str, language: Optional[str]) ->
     else:
         cpu_reason = "device not cuda"
 
+    # Fallback CPU
     asr_cpu = _ensure_cpu_model()
     segments_iter, info = asr_cpu.transcribe(
-        wav_path, language=language, vad_filter=VAD_FILTER, beam_size=BEAM_SIZE
+        wav_path,
+        language=language,
+        vad_filter=VAD_FILTER,
+        beam_size=BEAM_SIZE,
+        word_timestamps=(not USE_WHISPERX_ALIGN)
     )
-    segs = [{"start": float(s.start), "end": float(s.end), "text": (s.text or "").strip()}
-            for s in segments_iter]
+    segs = []
+    for s in segments_iter:
+        seg = {"start": float(s.start), "end": float(s.end), "text": (s.text or "").strip()}
+        if (not USE_WHISPERX_ALIGN) and getattr(s, "words", None):
+            seg["words"] = [
+                {"text": w.word, "start": float(w.start), "end": float(w.end),
+                 "prob": float(w.probability) if w.probability is not None else None}
+                for w in s.words
+            ]
+        segs.append(seg)
     lang = language or getattr(info, "language", "en")
     return segs, lang, {"engine": "cpu", "gpu_fail": cpu_reason}
 
@@ -288,20 +322,18 @@ class TranscribeUrlIn(BaseModel):
     url: str
     language: Optional[str] = None  # e.g., "fr", "en"
 
-# -------------------- Routes --------------------
+# -------------------- Warmup & Routes --------------------
 @app.post("/warmup", dependencies=[Depends(require_api_key)])
 def warmup(language: Optional[str] = "fr"):
-    # lance le warmup CPU en thread (non bloquant)
     threading.Thread(target=_warmup_cpu, daemon=True).start()
     return {
         "ok": True, "started": True, "device": DEVICE, "align_device": ALIGN_DEVICE,
         "model": WHISPERX_MODEL, "language": language or "fr",
-        "engine": "faster-whisper + whisperx-align",
+        "engine": "faster-whisper + whisperx-align (opt)",
         "warmed_cpu": WARMED_CPU, "warmed_gpu": WARMED_GPU
     }
 
 def _prefetch_gpu_model():
-    """Charge le modèle ASR GPU pour éliminer la latence du 1er appel."""
     global WARMED_GPU
     try:
         WhisperModel = _fw().WhisperModel
@@ -320,7 +352,6 @@ def _prefetch_gpu_model():
 def warmup_gpu():
     if DEVICE != "cuda":
         return {"ok": False, "message": "CUDA indisponible sur ce pod"}
-    # déclenche CPU + GPU warmups en tâche de fond
     threading.Thread(target=_warmup_cpu, daemon=True).start()
     threading.Thread(target=_prefetch_gpu_model, daemon=True).start()
     return {"ok": True, "started": True, "device": DEVICE, "compute_type": COMPUTE_TYPE}
@@ -358,19 +389,30 @@ async def _process_any(in_path: str, language: Optional[str] = None, engine: str
     # warmup opportuniste (ne bloque pas)
     if not WARMED_CPU:
         threading.Thread(target=_warmup_cpu, daemon=True).start()
-    if (engine.lower() in ("auto", "gpu")) and (DEVICE == "cuda") and (not WARMED_GPU):
-        threading.Thread(target=_prefetch_gpu_model, daemon=True).start()
 
     wav_path = _extract_audio_16k_mono(in_path)
     try:
+        # 1) ASR
         try:
             if engine.lower() == "cpu" or DEVICE != "cuda":
                 asr_cpu = _ensure_cpu_model()
                 segments_iter, info = asr_cpu.transcribe(
-                    wav_path, language=language, vad_filter=VAD_FILTER, beam_size=BEAM_SIZE
+                    wav_path,
+                    language=language,
+                    vad_filter=VAD_FILTER,
+                    beam_size=BEAM_SIZE,
+                    word_timestamps=(not USE_WHISPERX_ALIGN)
                 )
-                segments_list = [{"start": float(s.start), "end": float(s.end), "text": (s.text or "").strip()}
-                                 for s in segments_iter]
+                segments_list = []
+                for s in segments_iter:
+                    seg = {"start": float(s.start), "end": float(s.end), "text": (s.text or "").strip()}
+                    if (not USE_WHISPERX_ALIGN) and getattr(s, "words", None):
+                        seg["words"] = [
+                            {"text": w.word, "start": float(w.start), "end": float(w.end),
+                             "prob": float(w.probability) if w.probability is not None else None}
+                            for w in s.words
+                        ]
+                    segments_list.append(seg)
                 lang = language or getattr(info, "language", "en")
                 dbg = {"engine": "cpu", "forced": engine.lower() == "cpu"}
             elif engine.lower() in ("auto", "gpu"):
@@ -382,17 +424,22 @@ async def _process_any(in_path: str, language: Optional[str] = None, engine: str
                 "ok": False, "stage": "asr", "error": str(e), "trace": traceback.format_exc()
             })
 
+        # 2) Align (optionnel selon USE_WHISPERX_ALIGN)
         try:
-            align_model, metadata = _get_align_model(lang)
-            wx = _wx()
-            aligned = wx.align(
-                segments_list, align_model, metadata, wav_path, ALIGN_DEVICE, return_char_alignments=False
-            )
+            if USE_WHISPERX_ALIGN:
+                align_model, metadata = _get_align_model(lang)
+                wx = _wx()
+                aligned = wx.align(
+                    segments_list, align_model, metadata, wav_path, ALIGN_DEVICE, return_char_alignments=False
+                )
+            else:
+                aligned = {"segments": segments_list}
         except Exception as e:
             return JSONResponse(status_code=500, content={
                 "ok": False, "stage": "whisperx.align", "error": str(e), "trace": traceback.format_exc(), "dbg": dbg
             })
 
+        # 3) Diar (optionnelle)
         if DIARIZATION:
             try:
                 diar = _ensure_diarization()
@@ -405,6 +452,7 @@ async def _process_any(in_path: str, language: Optional[str] = None, engine: str
                     "ok": False, "stage": "diarization", "error": str(e), "trace": traceback.format_exc(), "dbg": dbg
                 })
 
+        # 4) Sortie
         merged = _merge_words_into_segments(aligned)
         vtt = _to_vtt(merged)
         srt = _to_srt(merged)
